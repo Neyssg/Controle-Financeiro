@@ -1,0 +1,1218 @@
+/**
+ * LICENÇA DE SOFTWARE - CONTROLE DE CRÉDITO E FLUXO DE CAIXA
+ *
+ * Copyright (c) 2024 [SEU NOME OU NOME DA ORGANIZAÇÃO]
+ *
+ * É concedida permissão, gratuitamente, a qualquer pessoa que obtenha uma cópia
+ * deste software e dos arquivos de documentação associados (o "Software"), para lidar
+ * com o Software sem restrições, incluindo, sem limitação, os direitos
+ * de usar, copiar, modificar, mesclar, publicar, distribuir, sublicenciar e/ou vender
+ * cópias do Software, e permitir que pessoas a quem o Software é
+ * fornecido o façam, sujeito às seguintes condições:
+ *
+ * A notificação de direitos autorais acima e esta notificação de permissão devem ser
+ * incluídas em todas as cópias ou partes substanciais do Software.
+ *
+ * O SOFTWARE É FORNECIDO "COMO ESTÁ", SEM GARANTIA DE QUALQUER TIPO, EXPRESSA OU
+ * IMPLÍCITA, INCLUINDO, MAS NÃO SE LIMITANDO ÀS GARANTIAS DE COMERCIALIZAÇÃO,
+ * ADEQUAÇÃO A UM FIM ESPECÍFICO E NÃO VIOLAÇÃO. EM NENHUM CASO OS AUTORES
+ * OU TITULARES DOS DIREITOS AUTORAIS SERÃO RESPONSÁVEIS POR QUALQUER RECLAMAÇÃO, DANOS
+ * OU OUTRA RESPONSABILIDADE, SEJA EM UMA AÇÃO DE CONTRATO, AGRAVO OU DE OUTRA FORMA,
+ * DECORRENTE DE, FORA DE OU EM CONEXÃO COM O SOFTWARE OU O USO OU OUTRAS NEGOCIAÇÕES
+ * NO SOFTWARE.
+ */
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import {
+  getFirestore, collection, query, onSnapshot, doc, addDoc, updateDoc, deleteDoc,
+  serverTimestamp,
+  setLogLevel
+} from 'firebase/firestore';
+import { DollarSign, CreditCard, Home, Plus, Edit, Trash2, TrendingUp, TrendingDown, Calendar, Tag, BarChart3 } from 'lucide-react';
+
+// --- Configuração Global Firebase (Obrigatório no Ambiente Canvas) ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Inicializa o Firebase App e os Serviços
+let app, db, auth;
+if (Object.keys(firebaseConfig).length > 0) {
+  try {
+    app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    auth = getAuth(app);
+    setLogLevel('error'); // Reduz o volume de logs do Firebase
+  } catch (error) {
+    console.error("Erro ao inicializar Firebase:", error);
+    db = null;
+    auth = null;
+  }
+}
+
+// --- Funções de Utilitário ---
+
+// Categorias Predefinidas
+const CATEGORIES = {
+    incomes: [
+        'Salário',
+        'Freelance/Extra',
+        'Investimentos',
+        'Presente',
+        'Outros'
+    ],
+    expenses: [
+        'Moradia (Aluguel, Financiamento)',
+        'Alimentação (Supermercado, Restaurantes)',
+        'Transporte (Gasolina, Apps, Bilhete)',
+        'Contas Fixas (Luz, Água, Internet)',
+        'Lazer',
+        'Saúde',
+        'Educação',
+        'Roupas/Acessórios',
+        'Outros'
+    ]
+};
+
+// Ajuda a formatar valores em Reais (BRL)
+const formatCurrency = (value) => {
+  return new Intl.NumberFormat('pt-BR', {
+    style: 'currency',
+    currency: 'BRL',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
+};
+
+// Formata data para DD/MM/AAAA
+const formatDate = (timestamp) => {
+    if (!timestamp) return 'N/A';
+    const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+    return date.toLocaleDateString('pt-BR', { year: 'numeric', month: '2-digit', day: '2-digit' });
+};
+
+// Retorna a data de hoje no formato YYYY-MM-DD para o input type="date"
+const getTodayDateString = () => {
+    return new Date().toISOString().split('T')[0];
+};
+
+// --- Componente de Modal Genérico ---
+const Modal = ({ children, title, onClose }) => (
+  <div className="fixed inset-0 z-50 overflow-y-auto bg-gray-900 bg-opacity-60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-auto transition-all transform duration-300 scale-100">
+      <div className="p-5 border-b border-gray-100 flex justify-between items-center">
+        <h3 className="text-xl font-bold text-gray-800">{title}</h3>
+        <button onClick={onClose} className="text-gray-400 hover:text-rose-500">
+        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+        </button>
+      </div>
+      <div className="p-5">
+        {children}
+      </div>
+    </div>
+  </div>
+);
+
+// --- Componente Reutilizável: Gerenciador de Transações (Receitas/Despesas) ---
+const TransactionManager = ({ userId, db, type, collectionName, icon: Icon }) => {
+    const [transactions, setTransactions] = useState([]);
+    const [isModalOpen, setIsModalOpen] = useState(false);
+    const [modalMode, setModalMode] = useState('add');
+    const [description, setDescription] = useState('');
+    const [amount, setAmount] = useState('');
+    const [transactionDate, setTransactionDate] = useState(getTodayDateString());
+    const [category, setCategory] = useState(''); 
+    const [transactionIdToEdit, setTransactionIdToEdit] = useState(null);
+
+    const isIncome = type === 'Receitas';
+    // Cores: Emerald para Receitas (crescimento), Rose para Despesas (alerta)
+    const color = isIncome ? 'text-emerald-600' : 'text-rose-600';
+    const accentBg = isIncome ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-rose-600 hover:bg-rose-700';
+    const borderAccent = isIncome ? 'border-emerald-400' : 'border-rose-400';
+    
+    const collectionPath = `artifacts/${appId}/users/${userId}/${collectionName}`;
+    const availableCategories = isIncome ? CATEGORIES.incomes : CATEGORIES.expenses;
+
+    // 1. Efeito para buscar dados em tempo real
+    useEffect(() => {
+        if (!db || !userId) return;
+
+        const q = query(collection(db, collectionPath));
+        
+        const unsubscribe = onSnapshot(q, (querySnapshot) => {
+            const fetchedTransactions = [];
+            querySnapshot.forEach((doc) => {
+                const data = doc.data();
+                fetchedTransactions.push({
+                    id: doc.id,
+                    description: data.description || 'Sem descrição',
+                    amount: data.amount || 0,
+                    date: data.date, 
+                    category: data.category || availableCategories[0], 
+                });
+            });
+            
+            // Ordena em memória pela data (mais recente primeiro)
+            fetchedTransactions.sort((a, b) => {
+                const dateA = a.date?.toDate ? a.date.toDate().getTime() : (a.date ? new Date(a.date).getTime() : 0);
+                const dateB = b.date?.toDate ? b.date.toDate().getTime() : (b.date ? new Date(b.date).getTime() : 0);
+                return dateB - dateA;
+            });
+
+            setTransactions(fetchedTransactions);
+        }, (error) => {
+            console.error(`Erro ao buscar ${collectionName}:`, error);
+        });
+
+        return () => unsubscribe();
+    }, [userId, db, collectionPath, availableCategories]);
+
+    // Soma total das transações
+    const totalAmount = transactions.reduce((sum, t) => sum + t.amount, 0);
+
+    // Funções de Gerenciamento
+    const openAddModal = () => {
+        setModalMode('add');
+        setDescription('');
+        setAmount('');
+        setTransactionDate(getTodayDateString());
+        setCategory(availableCategories[0]); 
+        setTransactionIdToEdit(null);
+        setIsModalOpen(true);
+    };
+
+    const openEditModal = (transaction) => {
+        setModalMode('edit');
+        setDescription(transaction.description);
+        setAmount(transaction.amount.toString());
+        
+        let dateString = getTodayDateString();
+        if (transaction.date) {
+            let dateObj = transaction.date.toDate ? transaction.date.toDate() : new Date(transaction.date);
+            dateString = dateObj.toISOString().split('T')[0];
+        }
+        setTransactionDate(dateString); 
+        setCategory(transaction.category || availableCategories[0]); 
+        setTransactionIdToEdit(transaction.id);
+        setIsModalOpen(true);
+    };
+
+    const handleSaveTransaction = async (e) => {
+        e.preventDefault();
+        if (!db || !userId) return;
+
+        const amountValue = parseFloat(amount.replace(',', '.'));
+        if (isNaN(amountValue) || amountValue <= 0) {
+            console.error("Valor inválido.");
+            return;
+        }
+
+        const transactionDateObject = new Date(transactionDate + 'T12:00:00');
+
+        const transactionData = {
+            description: description,
+            amount: amountValue,
+            date: transactionDateObject, 
+            category: category, 
+            updatedAt: serverTimestamp(),
+        };
+
+        try {
+            if (modalMode === 'add') {
+                await addDoc(collection(db, collectionPath), {
+                    ...transactionData,
+                    createdAt: serverTimestamp(),
+                });
+            } else if (modalMode === 'edit' && transactionIdToEdit) {
+                await updateDoc(doc(db, collectionPath, transactionIdToEdit), transactionData);
+            }
+            setIsModalOpen(false);
+            setDescription('');
+            setAmount('');
+            setTransactionDate(getTodayDateString());
+            setCategory(availableCategories[0]);
+            setTransactionIdToEdit(null);
+        } catch (error) {
+            console.error(`Erro ao salvar ${type}:`, error);
+        }
+    };
+
+    const handleDeleteTransaction = async (id) => {
+        if (!window.confirm(`Tem certeza que deseja deletar esta ${type === 'Receitas' ? 'receita' : 'despesa'}?`)) return;
+
+        if (!db || !userId) return;
+        try {
+            await deleteDoc(doc(db, collectionPath, id));
+        } catch (error) {
+            console.error(`Erro ao deletar ${type}:`, error);
+        }
+    };
+
+    return (
+        <div className="p-4 space-y-6">
+            <h1 className={`text-3xl font-bold ${color} flex justify-between items-center`}>
+                <Icon className="w-7 h-7 mr-2 inline-block transition-transform duration-300 hover:rotate-6"/>
+                {type}
+                <button
+                    onClick={openAddModal}
+                    className={`${accentBg} text-white font-semibold py-2 px-4 rounded-full shadow-lg transition duration-300 flex items-center text-sm transform hover:scale-[1.05] active:scale-95 group`}
+                >
+                    <Plus className="w-5 h-5 mr-1 group-hover:animate-pulse" /> Nova {type.slice(0, -1)}
+                </button>
+            </h1>
+
+            {/* Total Acumulado */}
+            <div className={`bg-white p-5 rounded-2xl shadow-xl border-l-4 ${borderAccent}`}>
+                <p className="text-sm font-medium text-gray-500">Total Acumulado ({type})</p>
+                <p className={`text-3xl font-bold ${color}`}>{formatCurrency(totalAmount)}</p>
+            </div>
+
+            {/* Lista de Transações */}
+            <div className="space-y-3">
+                <h2 className="text-xl font-semibold text-gray-800 border-b pb-2">Últimos Lançamentos</h2>
+                {transactions.length === 0 ? (
+                    <p className="text-gray-500 italic p-4 bg-white rounded-lg text-center">Nenhuma {type.slice(0, -1)} cadastrada.</p>
+                ) : (
+                    transactions.map(t => (
+                        <div key={t.id} className="bg-white p-4 rounded-xl shadow-md border border-gray-100 flex justify-between items-center transition duration-200 hover:shadow-lg">
+                            <div className="flex-1 min-w-0">
+                                <p className="text-lg font-medium text-gray-900 truncate">{t.description}</p>
+                                <div className="text-sm text-gray-500 flex items-center mt-1 space-x-3">
+                                    <span className="flex items-center">
+                                        <Calendar className="w-4 h-4 mr-1"/>
+                                        <span>{formatDate(t.date)}</span>
+                                    </span>
+                                    {t.category && (
+                                        <span className="flex items-center px-2 py-0.5 bg-gray-100 text-gray-700 rounded-full text-xs font-medium">
+                                            <Tag className="w-3 h-3 mr-1"/>
+                                            {t.category}
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="flex items-center space-x-3 ml-4">
+                                <p className={`text-lg font-bold ${color}`}>
+                                    {formatCurrency(t.amount)}
+                                </p>
+                                <button
+                                    onClick={() => openEditModal(t)}
+                                    className="text-gray-400 hover:text-indigo-600 p-1 transition duration-200 rounded-full hover:bg-gray-100"
+                                    aria-label="Editar Transação"
+                                >
+                                    <Edit className="w-5 h-5" />
+                                </button>
+                                <button
+                                    onClick={() => handleDeleteTransaction(t.id)}
+                                    className="text-gray-400 hover:text-rose-600 p-1 transition duration-200 rounded-full hover:bg-gray-100"
+                                    aria-label="Deletar Transação"
+                                >
+                                    <Trash2 className="w-5 h-5" />
+                                </button>
+                            </div>
+                        </div>
+                    ))
+                )}
+            </div>
+
+            {/* Modal de Gerenciamento de Transação */}
+            {isModalOpen && (
+                <Modal title={modalMode === 'add' ? `Adicionar Nova ${type.slice(0, -1)}` : `Editar ${type.slice(0, -1)}`} onClose={() => setIsModalOpen(false)}>
+                    <form onSubmit={handleSaveTransaction} className="space-y-4">
+                        
+                        {/* Campo de Data */}
+                        <div>
+                            <label htmlFor="transactionDate" className="block text-sm font-medium text-gray-700">Data do Lançamento</label>
+                            <input
+                                type="date"
+                                id="transactionDate"
+                                value={transactionDate}
+                                onChange={(e) => setTransactionDate(e.target.value)}
+                                required
+                                // Foco: Usa Indigo 700 para reforçar a confiança
+                                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:outline-none focus:ring-indigo-700 focus:border-indigo-700"
+                            />
+                        </div>
+
+                         {/* Campo de Categoria */}
+                        <div>
+                            <label htmlFor="category" className="block text-sm font-medium text-gray-700">Categoria</label>
+                            <select
+                                id="category"
+                                value={category}
+                                onChange={(e) => setCategory(e.target.value)}
+                                required
+                                // Foco: Usa Indigo 700
+                                className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 rounded-xl shadow-sm focus:outline-none focus:ring-indigo-700 focus:border-indigo-700 sm:text-sm"
+                            >
+                                {availableCategories.map((cat) => (
+                                    <option key={cat} value={cat}>{cat}</option>
+                                ))}
+                            </select>
+                        </div>
+
+                        <div>
+                            <label htmlFor="description" className="block text-sm font-medium text-gray-700">Descrição</label>
+                            <input
+                                type="text"
+                                id="description"
+                                value={description}
+                                onChange={(e) => setDescription(e.target.value)}
+                                required
+                                // Foco: Usa Indigo 700
+                                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:outline-none focus:ring-indigo-700 focus:border-indigo-700"
+                                placeholder={isIncome ? "Ex: Salário, Freelance" : "Ex: Aluguel, Supermercado"}
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="amount" className="block text-sm font-medium text-gray-700">Valor (R$)</label>
+                            <input
+                                type="number"
+                                id="amount"
+                                value={amount}
+                                onChange={(e) => setAmount(e.target.value)}
+                                required
+                                min="0.01"
+                                step="0.01"
+                                // Foco: Usa Indigo 700
+                                className="mt-1 block w-full px-3 py-2 text-3xl border-b-2 border-gray-300 rounded-t-xl shadow-sm focus:outline-none focus:ring-indigo-700 focus:border-indigo-700 text-center"
+                                placeholder="0.00"
+                            />
+                        </div>
+                        <button
+                            type="submit"
+                            className={`w-full font-semibold py-3 px-4 rounded-xl shadow-lg transition duration-300 ${accentBg} text-white transform hover:scale-[1.01] active:scale-95`}
+                        >
+                            {modalMode === 'add' ? `Adicionar ${type.slice(0, -1)}` : 'Salvar Alterações'}
+                        </button>
+                    </form>
+                </Modal>
+            )}
+        </div>
+    );
+};
+
+
+// --- Componente da Página Início (Dashboard) ---
+const HomePage = ({ cards, incomeTotal, expenseTotal }) => {
+  const totalLimit = cards.reduce((sum, card) => sum + card.limit, 0);
+  const totalSpent = cards.reduce((sum, card) => sum + card.spent, 0);
+  const totalAvailable = totalLimit - totalSpent;
+  const netBalance = incomeTotal - expenseTotal;
+
+  return (
+    <div className="p-4 space-y-6">
+      <h1 className="text-3xl font-bold text-gray-800">Seu Resumo Financeiro</h1>
+
+      {/* Cards de Visão Geral (Saldo e Fluxo) */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <OverviewCard 
+          title="Saldo Líquido (Receita - Despesa)" 
+          value={netBalance} 
+          // Usa Emerald para positivo e Rose para negativo
+          color={netBalance >= 0 ? "text-emerald-600" : "text-rose-600"} 
+          icon={DollarSign} 
+          // Borda Primária (Indigo 500)
+          accentColor="border-indigo-500"
+        />
+        <OverviewCard 
+          title="Receitas Totais" 
+          value={incomeTotal} 
+          color="text-emerald-600" 
+          icon={TrendingUp} 
+          accentColor="border-emerald-400" 
+        />
+        <OverviewCard 
+          title="Despesas Totais" 
+          value={expenseTotal} 
+          color="text-rose-600" 
+          icon={TrendingDown} 
+          accentColor="border-rose-400" 
+        />
+      </div>
+
+      {/* Resumo dos Cartões */}
+      <div className="pt-4">
+        <h2 className="text-2xl font-semibold mb-4 text-gray-800">Situação de Crédito</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+            <OverviewCard 
+              title="Limite Total Geral" 
+              value={totalLimit} 
+              // Usa Indigo 600
+              color="text-indigo-600" 
+              icon={DollarSign} 
+              accentColor="border-indigo-400" 
+            />
+            <OverviewCard 
+              title="Gasto Acumulado" 
+              value={totalSpent} 
+              color="text-rose-600" 
+              icon={CreditCard} 
+              accentColor="border-rose-400" 
+            />
+            <OverviewCard 
+              title="Limite Disponível Geral" 
+              value={totalAvailable} 
+              // Usa Indigo 600
+              color="text-indigo-600" 
+              icon={DollarSign} 
+              accentColor="border-indigo-400" 
+            />
+        </div>
+        
+        <h3 className="text-xl font-semibold mb-3 text-gray-800">Detalhe por Cartão</h3>
+        <div className="space-y-3">
+          {cards.length === 0 ? (
+            <p className="text-gray-500 italic">Nenhum cartão cadastrado. Vá para "Cartões" para adicionar um.</p>
+          ) : (
+            cards.map(card => {
+              const available = card.limit - card.spent;
+              const percentageSpent = (card.spent / card.limit) * 100;
+              const color = percentageSpent > 80 ? 'bg-rose-500' : percentageSpent > 50 ? 'bg-amber-500' : 'bg-emerald-500';
+
+              return (
+                <div key={card.id} className="bg-white p-4 rounded-xl shadow-lg transition duration-300 hover:shadow-xl border border-gray-100">
+                  <div className="flex justify-between items-center mb-2">
+                    <h3 className="text-lg font-medium text-gray-900">{card.name}</h3>
+                    <span className="text-sm font-semibold text-gray-600">Vencimento: Dia {card.dueDate || '?'}</span>
+                  </div>
+                  <div className="text-sm text-gray-700">
+                    <p className="mb-1">Limite: <span className="font-bold">{formatCurrency(card.limit)}</span></p>
+                    <p className="mb-1">Gasto: <span className="font-bold">{formatCurrency(card.spent)}</span></p>
+                    <p>Disponível: <span className="font-bold" style={{ color: available < 0 ? '#f43f5e' : '#10b981' }}>{formatCurrency(available)}</span></p>
+                  </div>
+
+                  <div className="mt-3">
+                    <div className="w-full bg-gray-200 rounded-full h-2.5">
+                      <div
+                        className={`h-2.5 rounded-full ${color}`}
+                        style={{ width: `${Math.min(100, percentageSpent)}%` }}
+                      ></div>
+                    </div>
+                    <p className="text-xs text-right mt-1 text-gray-500">{percentageSpent.toFixed(1)}% utilizado</p>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Componente Card de Visão Geral com cores e ANIMAÇÃO aprimoradas
+const OverviewCard = ({ title, value, color, icon: Icon, accentColor }) => {
+    // Usa o tom mais claro da cor principal para o fundo do ícone
+    const iconBgColor = color.replace('text-', 'bg-').replace('-600', '-100'); 
+    
+    return (
+        <div className={`bg-white p-5 rounded-2xl shadow-xl border-l-4 ${accentColor} group`}>
+            <div className="flex items-center">
+                <div className={`p-3 rounded-full ${iconBgColor}`}>
+                    <Icon className={`w-6 h-6 ${color} transition-transform duration-300 group-hover:rotate-6`} />
+                </div>
+                <div className="ml-4">
+                    <p className="text-sm font-medium text-gray-500">{title}</p>
+                    <p className={`text-2xl font-bold ${color}`}>{formatCurrency(value)}</p>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+
+// --- Componente da Página Cartões de Crédito (Mantido) ---
+const CreditCardsPage = ({ cards, userId, db }) => {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [modalMode, setModalMode] = useState('add');
+  const [cardName, setCardName] = useState('');
+  const [cardLimit, setCardLimit] = useState('');
+  const [cardDueDate, setCardDueDate] = useState(''); 
+  const [cardIdToEdit, setCardIdToEdit] = useState(null);
+
+  const [isActionModalOpen, setIsActionModalOpen] = useState(false);
+  const [actionType, setActionType] = useState('');
+  const [actionCardId, setActionCardId] = useState(null);
+  const [actionAmount, setActionAmount] = useState('');
+
+  const cardCollectionPath = `artifacts/${appId}/users/${userId}/creditCards`;
+
+  const openAddModal = () => {
+    setModalMode('add');
+    setCardName('');
+    setCardLimit('');
+    setCardDueDate(''); 
+    setCardIdToEdit(null);
+    setIsModalOpen(true);
+  };
+
+  const openEditModal = (card) => {
+    setModalMode('edit');
+    setCardName(card.name);
+    setCardLimit(card.limit.toString());
+    setCardDueDate(card.dueDate ? card.dueDate.toString() : ''); 
+    setCardIdToEdit(card.id);
+    setIsModalOpen(true);
+  };
+
+  const handleSaveCard = async (e) => {
+    e.preventDefault();
+    if (!db || !userId) { console.error("Firestore ou UserId não estão prontos."); return; }
+
+    const limitValue = parseFloat(cardLimit.replace(',', '.'));
+    const dueDateValue = parseInt(cardDueDate, 10);
+
+    if (isNaN(limitValue) || limitValue <= 0 || isNaN(dueDateValue) || dueDateValue < 1 || dueDateValue > 31) {
+      console.error("Valor de limite ou dia de vencimento inválido. O dia deve ser entre 1 e 31.");
+      return;
+    }
+
+    const cardData = {
+      name: cardName,
+      limit: limitValue,
+      dueDate: dueDateValue, 
+      updatedAt: serverTimestamp(),
+    };
+
+    try {
+      if (modalMode === 'add') {
+        await addDoc(collection(db, cardCollectionPath), {
+          ...cardData,
+          spent: 0,
+          createdAt: serverTimestamp(),
+        });
+      } else if (modalMode === 'edit' && cardIdToEdit) {
+        await updateDoc(doc(db, cardCollectionPath, cardIdToEdit), cardData);
+      }
+      setIsModalOpen(false);
+      setCardName(''); setCardLimit(''); setCardDueDate(''); setCardIdToEdit(null);
+    } catch (error) {
+      console.error("Erro ao salvar cartão:", error);
+    }
+  };
+
+  const handleDeleteCard = async (cardId) => {
+    if (!window.confirm("Tem certeza que deseja deletar este cartão? Esta ação é irreversível.")) return;
+    if (!db || !userId) { console.error("Firestore ou UserId não estão prontos."); return; }
+    try {
+      await deleteDoc(doc(db, cardCollectionPath, cardId));
+    } catch (error) {
+      console.error("Erro ao deletar cartão:", error);
+    }
+  };
+
+  const openActionModal = (type, cardId) => {
+    setActionType(type);
+    setActionCardId(cardId);
+    setActionAmount('');
+    setIsActionModalOpen(true);
+  };
+
+  const handleAction = async (e) => {
+    e.preventDefault();
+    if (!db || !userId || !actionCardId) { console.error("Firestore, UserId ou CardId não estão prontos."); return; }
+
+    const amountValue = parseFloat(actionAmount.replace(',', '.'));
+    if (isNaN(amountValue) || amountValue <= 0) { console.error("Valor de ação inválido."); return; }
+
+    try {
+      const cardRef = doc(db, cardCollectionPath, actionCardId);
+      const currentCard = cards.find(c => c.id === actionCardId);
+
+      if (!currentCard) { console.error("Cartão não encontrado para a ação."); return; }
+
+      let newSpent = currentCard.spent;
+      if (actionType === 'spend') {
+        newSpent += amountValue;
+      } else if (actionType === 'pay') {
+        newSpent = Math.max(0, currentCard.spent - amountValue);
+      }
+
+      await updateDoc(cardRef, { spent: newSpent, updatedAt: serverTimestamp(), });
+
+      setIsActionModalOpen(false);
+      setActionAmount('');
+    } catch (error) {
+      console.error(`Erro ao registrar ${actionType}:`, error);
+    }
+  };
+
+  return (
+    <div className="p-4 space-y-6">
+      <h1 className="text-3xl font-bold text-gray-800 flex justify-between items-center">
+        Meus Cartões de Crédito
+        <button
+          onClick={openAddModal}
+          // Botão primário usa Indigo 600
+          className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-full shadow-lg transition duration-300 flex items-center text-sm transform hover:scale-[1.05] active:scale-95 group"
+        >
+          <Plus className="w-5 h-5 mr-1 group-hover:animate-pulse" /> Novo Cartão
+        </button>
+      </h1>
+
+      {/* Lista de Cartões */}
+      <div className="space-y-4">
+        {cards.length === 0 ? (
+          <div className="text-center p-8 bg-white rounded-2xl shadow-xl">
+            <CreditCard className="w-10 h-10 text-gray-400 mx-auto mb-3" />
+            <p className="text-gray-500">Nenhum cartão cadastrado ainda. Clique em "Novo Cartão" para começar.</p>
+          </div>
+        ) : (
+          cards.map(card => {
+            const available = card.limit - card.spent;
+            const percentageSpent = (card.spent / card.limit) * 100;
+            const colorClass = percentageSpent > 80 ? 'bg-rose-100 border-rose-400' : percentageSpent > 50 ? 'bg-amber-100 border-amber-400' : 'bg-emerald-100 border-emerald-400';
+
+            return (
+              <div key={card.id} className={`bg-white p-4 rounded-2xl shadow-lg border-2 ${colorClass} transition duration-300 hover:shadow-xl`}>
+                <div className="flex justify-between items-start mb-3">
+                  <h3 className="text-xl font-bold text-gray-900">{card.name}</h3>
+                  <div className="flex space-x-2">
+                    <button
+                      onClick={() => openEditModal(card)}
+                      // Ícone de Edição usa Indigo 600
+                      className="text-gray-500 hover:text-indigo-600 p-1 transition duration-200 rounded-full hover:bg-gray-100"
+                      aria-label="Editar Cartão"
+                    >
+                      <Edit className="w-5 h-5" />
+                    </button>
+                    <button
+                      onClick={() => handleDeleteCard(card.id)}
+                      className="text-gray-500 hover:text-rose-600 p-1 transition duration-200 rounded-full hover:bg-gray-100"
+                      aria-label="Deletar Cartão"
+                    >
+                      <Trash2 className="w-5 h-5" />
+                    </button>
+                  </div>
+                </div>
+
+                <p className="text-sm font-medium text-gray-600 mb-3">Vencimento: <span className="font-bold text-gray-800">Dia {card.dueDate || '?'}</span></p>
+
+                <div className="grid grid-cols-3 text-center border-t border-b py-3 mb-4 text-sm font-semibold text-gray-700">
+                  <div>
+                    <p className="text-xs text-gray-500">Limite Total</p>
+                    <p className="text-emerald-600">{formatCurrency(card.limit)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-gray-500">Gasto</p>
+                    <p className="text-rose-600">{formatCurrency(card.spent)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-gray-500">Disponível</p>
+                    <p style={{ color: available < 0 ? '#f43f5e' : '#10b981' }}>{formatCurrency(available)}</p>
+                  </div>
+                </div>
+
+                {/* Botões de Ação */}
+                <div className="flex justify-between space-x-2">
+                  <button
+                    onClick={() => openActionModal('spend', card.id)}
+                    className="flex-1 bg-rose-600 hover:bg-rose-700 text-white py-2 rounded-xl font-medium shadow-md transition duration-200 text-sm"
+                  >
+                    Registrar Gasto
+                  </button>
+                  <button
+                    onClick={() => openActionModal('pay', card.id)}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-2 rounded-xl font-medium shadow-md transition duration-200 text-sm"
+                  >
+                    Informar Pagamento
+                  </button>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* --- Modal de Gerenciamento do Cartão (Adicionar/Editar) --- */}
+      {isModalOpen && (
+        <Modal title={modalMode === 'add' ? 'Adicionar Novo Cartão' : 'Editar Cartão'} onClose={() => setIsModalOpen(false)}>
+          <form onSubmit={handleSaveCard} className="space-y-4">
+            <div>
+              <label htmlFor="cardName" className="block text-sm font-medium text-gray-700">Nome do Cartão (ex: Visa, Nubank)</label>
+              <input
+                type="text"
+                id="cardName"
+                value={cardName}
+                onChange={(e) => setCardName(e.target.value)}
+                required
+                // Foco: Usa Indigo 700
+                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:outline-none focus:ring-indigo-700 focus:border-indigo-700"
+                placeholder="Nome"
+              />
+            </div>
+            <div>
+              <label htmlFor="cardLimit" className="block text-sm font-medium text-gray-700">Limite Total (R$)</label>
+              <input
+                type="number"
+                id="cardLimit"
+                value={cardLimit}
+                onChange={(e) => setCardLimit(e.target.value)}
+                required
+                min="0.01"
+                step="0.01"
+                // Foco: Usa Indigo 700
+                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:outline-none focus:ring-indigo-700 focus:border-indigo-700"
+                placeholder="0.00"
+              />
+            </div>
+            <div>
+              <label htmlFor="cardDueDate" className="block text-sm font-medium text-gray-700">Dia do Vencimento (1 a 31)</label>
+              <input
+                type="number"
+                id="cardDueDate"
+                value={cardDueDate}
+                onChange={(e) => setCardDueDate(e.target.value)}
+                required
+                min="1"
+                max="31"
+                // Foco: Usa Indigo 700
+                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:outline-none focus:ring-indigo-700 focus:border-indigo-700"
+                placeholder="Ex: 15"
+              />
+            </div>
+            <button
+              type="submit"
+              // Botão primário usa Indigo 600
+              className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-xl shadow-md transition duration-300 transform hover:scale-[1.01] active:scale-95"
+            >
+              {modalMode === 'add' ? 'Adicionar Cartão' : 'Salvar Alterações'}
+            </button>
+          </form>
+        </Modal>
+      )}
+
+      {/* --- Modal de Ação (Gasto/Pagamento) --- */}
+      {isActionModalOpen && (
+        <Modal
+          title={actionType === 'spend' ? 'Registrar Gasto' : 'Informar Pagamento de Fatura'}
+          onClose={() => setIsActionModalOpen(false)}
+        >
+          <form onSubmit={handleAction} className="space-y-4">
+            <p className="text-gray-600">
+              {actionType === 'spend' ? 'Insira o valor gasto:' : 'Insira o valor pago da fatura:'}
+            </p>
+            <div>
+              <label htmlFor="actionAmount" className="sr-only">Valor</label>
+              <input
+                type="number"
+                id="actionAmount"
+                value={actionAmount}
+                onChange={(e) => setActionAmount(e.target.value)}
+                required
+                min="0.01"
+                step="0.01"
+                // Foco: Usa Indigo 700
+                className="mt-1 block w-full px-3 py-2 text-3xl border-b-2 border-gray-300 rounded-t-xl shadow-sm focus:outline-none focus:ring-indigo-700 focus:border-indigo-700 text-center"
+                placeholder="0.00"
+                autoFocus
+              />
+            </div>
+            <button
+              type="submit"
+              className={`w-full font-semibold py-3 px-4 rounded-xl shadow-md transition duration-300 ${
+                // Cores de ação aprimoradas (Rose e Emerald)
+                actionType === 'spend' ? 'bg-rose-600 hover:bg-rose-700 text-white' : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+              } transform hover:scale-[1.01] active:scale-95`}
+            >
+              Confirmar {actionType === 'spend' ? 'Gasto' : 'Pagamento'}
+            </button>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// --- Funções e Componentes de Análise ---
+
+// Cores aprimoradas para o gráfico de pizza (mais contraste e alinhadas ao tema)
+const PIE_COLORS = [
+    '#4338CA', // Indigo 700 (Primária/Confiança)
+    '#E11D48', // Rose 600 (Ação/Despesa)
+    '#059669', // Emerald 600 (Sucesso/Receita)
+    '#FBBF24', // Amber 500 (Neutro/Alerta)
+    '#6B7280', // Gray 600 (Neutro)
+    '#06B6D4', // Cyan 500 (Secundário)
+    '#A855F7', // Violet 500
+    '#CC5500', // Terracota
+];
+
+// Lógica de agregação dos gastos por categoria
+const aggregateExpensesByCategory = (expenses) => {
+    const aggregation = expenses.reduce((acc, expense) => {
+        const category = expense.category || 'Outros'; 
+        const amount = expense.amount || 0;
+        acc[category] = (acc[category] || 0) + amount;
+        return acc;
+    }, {});
+
+    const total = Object.values(aggregation).reduce((sum, amount) => sum + amount, 0);
+
+    // Converte para array de objetos, calcula porcentagem e ordena
+    return Object.keys(aggregation).map(category => ({
+        category,
+        amount: aggregation[category],
+        percentage: total > 0 ? (aggregation[category] / total) * 100 : 0
+    })).sort((a, b) => b.amount - a.amount);
+};
+
+
+// Função utilitária para calcular coordenadas em um círculo
+const getCoordinatesForAngle = (angle) => {
+    // Subtrai 90 graus para que o início (0) seja no topo do círculo
+    const rad = (angle - 90) * Math.PI / 180; 
+    const x = 50 + 40 * Math.cos(rad); // 50 = centro X, 40 = raio
+    const y = 50 + 40 * Math.sin(rad); // 50 = centro Y, 40 = raio
+    // Retorna coordenadas com precisão total, sem arredondar para toFixed()
+    return `${x},${y}`;
+};
+
+
+// Componente para o Gráfico de Pizza (utiliza SVG puro)
+const PieChart = ({ data, totalAmount }) => {
+    if (totalAmount === 0) {
+        return <p className="text-center text-gray-500 italic p-4">Adicione despesas para ver o gráfico.</p>;
+    }
+
+    let cumulativePercentage = 0;
+    
+    // Converte os dados agregados em coordenadas de SVG para o path
+    const pieSlices = data.flatMap((item, index) => { 
+        // 1. Ignora fatias muito pequenas ou nulas.
+        if (item.percentage <= 0.001) {
+             cumulativePercentage += item.percentage;
+             return []; // Retorna um array vazio para o flatMap
+        }
+
+        const color = PIE_COLORS[index % PIE_COLORS.length];
+        
+        // --- CORREÇÃO CRÍTICA: TRATAMENTO DE 100% (Círculo Completo) ---
+        if (item.percentage >= 99.99 && data.length === 1) {
+            // Se houver apenas 1 item e ele for 100%, desenha dois arcos de 50%
+            // para contornar o bug do comando 'A' do SVG.
+            
+            // Ponto de início (Topo) e Ponto de 180 graus (Baixo)
+            const start = getCoordinatesForAngle(0); 
+            const mid = getCoordinatesForAngle(180); 
+            
+            // Primeiro arco (0 a 180 graus)
+            const path1 = `M 50,50 L ${start} A 40,40 0 1,1 ${mid} Z`;
+            // Segundo arco (180 a 360 graus) - O fim é o mesmo que o início (start/0 graus)
+            const path2 = `M 50,50 L ${mid} A 40,40 0 1,1 ${start} Z`;
+            
+            cumulativePercentage = 100;
+            return [
+                { path: path1, color: color, label: item.category, percentage: item.percentage },
+                { path: path2, color: color, label: item.category, percentage: item.percentage },
+            ];
+        }
+
+        // --- Tratamento padrão para fatias normais ---
+        const startAngle = cumulativePercentage * 3.6;
+        cumulativePercentage += item.percentage;
+        let endAngle = cumulativePercentage * 3.6;
+
+        // Se for a última fatia e o total for 100% (arredondado), forçamos o final para 360
+        // para garantir o fechamento.
+        if (index === data.length - 1 && Math.abs(cumulativePercentage - 100) < 0.1) {
+             endAngle = 360;
+        }
+
+        const start = getCoordinatesForAngle(startAngle);
+        const end = getCoordinatesForAngle(endAngle);
+
+        const largeArcFlag = item.percentage > 50 ? 1 : 0;
+        
+        const d = `
+            M 50,50 
+            L ${start} 
+            A 40,40 0 ${largeArcFlag},1 ${end} 
+            Z
+        `;
+
+        return [{
+            path: d,
+            color: color,
+            label: item.category,
+            percentage: item.percentage
+        }];
+    });
+
+    return (
+        <div className="flex flex-col md:flex-row items-center justify-center p-2 bg-white rounded-2xl shadow-xl">
+            {/* Gráfico SVG */}
+            <svg viewBox="0 0 100 100" className="w-full max-w-sm h-auto my-4 mx-auto" style={{ maxHeight: '300px' }}>
+                {pieSlices.length === 0 ? (
+                    <text x="50" y="50" dominantBaseline="middle" textAnchor="middle" fontSize="5" fill="#9CA3AF">Dados indisponíveis</text>
+                ) : (
+                    pieSlices.map((slice, index) => (
+                        <path
+                            key={index}
+                            d={slice.path}
+                            fill={slice.color}
+                            className="transition-transform duration-300 hover:scale-[1.05]"
+                        />
+                    ))
+                )}
+            </svg>
+
+            {/* Legenda */}
+            <div className="w-full md:w-1/2 p-4 space-y-2 max-h-96 overflow-y-auto">
+                <h3 className="text-lg font-semibold border-b pb-1 text-gray-700">Distribuição</h3>
+                {data.map((item, index) => (
+                    <div key={item.category} className="flex justify-between items-center text-sm p-1 hover:bg-gray-50 rounded-lg">
+                        <div className="flex items-center truncate max-w-[70%]">
+                            <span className="w-3 h-3 rounded-full mr-2 flex-shrink-0" style={{ backgroundColor: PIE_COLORS[index % PIE_COLORS.length] }}></span>
+                            <span className="font-medium text-gray-800 truncate">{item.category}</span>
+                        </div>
+                        <div className="text-right flex flex-col sm:flex-row sm:space-x-2">
+                            <span className="font-bold text-rose-600">{item.percentage.toFixed(1)}%</span>
+                            <span className="text-gray-500 text-xs">({formatCurrency(item.amount)})</span>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+
+// --- Componente da Página de Análise de Despesas ---
+const ExpenseAnalysisPage = ({ expenses }) => {
+    const aggregatedData = aggregateExpensesByCategory(expenses);
+    const totalExpenseAmount = expenses.reduce((sum, e) => sum + (e.amount || 0), 0);
+
+    return (
+        <div className="p-4 space-y-6">
+            <h1 className="text-3xl font-bold text-rose-600 flex items-center">
+                <BarChart3 className="w-7 h-7 mr-2 transition-transform duration-300 hover:scale-110"/>
+                Análise de Gastos por Categoria
+            </h1>
+
+            <div className="bg-white p-5 rounded-2xl shadow-xl border-l-4 border-rose-400">
+                <p className="text-sm font-medium text-gray-500">Total de Despesas Analisado</p>
+                <p className="text-3xl font-bold text-rose-600">{formatCurrency(totalExpenseAmount)}</p>
+            </div>
+
+            <h2 className="text-xl font-semibold text-gray-800 border-b pb-2">Distribuição Percentual</h2>
+            
+            <PieChart data={aggregatedData} totalAmount={totalExpenseAmount} />
+        </div>
+    );
+};
+
+
+// --- Componente Principal da Aplicação ---
+const App = () => {
+  const [currentPage, setCurrentPage] = useState('Início'); 
+  const [userId, setUserId] = useState(null);
+  const [cards, setCards] = useState([]);
+  const [incomes, setIncomes] = useState([]); 
+  const [expenses, setExpenses] = useState([]); 
+  const [isLoading, setIsLoading] = useState(true);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // 1. Efeito de Autenticação e Inicialização
+  useEffect(() => {
+    if (!auth) {
+      setIsAuthReady(true);
+      return;
+    }
+
+    const signIn = async () => {
+      try {
+        if (initialAuthToken) {
+          await signInWithCustomToken(auth, initialAuthToken);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Erro no login Firebase:", error);
+      }
+    };
+
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        signIn();
+      }
+      setIsAuthReady(true);
+      setIsLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Efeito do Listener de Dados (Cartões, Receitas, Despesas)
+  useEffect(() => {
+    if (!db || !userId || !isAuthReady) return;
+
+    // --- Cartões ---
+    const cardCollectionPath = `artifacts/${appId}/users/${userId}/creditCards`;
+    const unsubCards = onSnapshot(query(collection(db, cardCollectionPath)), (querySnapshot) => {
+      const fetchedCards = [];
+      querySnapshot.forEach((doc) => {
+        const data = doc.data();
+        fetchedCards.push({
+          id: doc.id,
+          name: data.name || 'Cartão Sem Nome',
+          limit: data.limit || 0,
+          spent: data.spent || 0,
+          dueDate: data.dueDate || null, 
+        });
+      });
+      fetchedCards.sort((a, b) => a.name.localeCompare(b.name));
+      setCards(fetchedCards);
+    }, (error) => {
+      console.error("Erro ao escutar dados de Cartões:", error);
+    });
+
+    // --- Receitas ---
+    const incomePath = `artifacts/${appId}/users/${userId}/incomes`;
+    const unsubIncomes = onSnapshot(query(collection(db, incomePath)), (querySnapshot) => {
+        const fetchedIncomes = [];
+        querySnapshot.forEach((doc) => {
+            fetchedIncomes.push({ id: doc.id, ...doc.data() });
+        });
+        setIncomes(fetchedIncomes);
+    }, (error) => { console.error("Erro ao escutar Receitas:", error); });
+
+    // --- Despesas ---
+    const expensePath = `artifacts/${appId}/users/${userId}/expenses`;
+    const unsubExpenses = onSnapshot(query(collection(db, expensePath)), (querySnapshot) => {
+        const fetchedExpenses = [];
+        querySnapshot.forEach((doc) => {
+            fetchedExpenses.push({ id: doc.id, ...doc.data() });
+        });
+        setExpenses(fetchedExpenses);
+    }, (error) => { console.error("Erro ao escutar Despesas:", error); });
+
+    return () => {
+        unsubCards();
+        unsubIncomes();
+        unsubExpenses();
+    };
+  }, [userId, isAuthReady]); 
+
+  const totalIncome = incomes.reduce((sum, item) => sum + (item.amount || 0), 0);
+  const totalExpense = expenses.reduce((sum, item) => sum + (item.amount || 0), 0);
+
+
+  if (isLoading || !isAuthReady) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-100">
+        <div className="text-center">
+          <div className="animate-pulse rounded-full h-12 w-12 border-b-2 border-indigo-700 mx-auto"></div>
+          <p className="mt-4 text-gray-600">Carregando dados financeiros...</p>
+        </div>
+      </div>
+    );
+  }
+
+  const renderPage = () => {
+    if (!userId) {
+      return (
+        <div className="p-4 text-center">
+          <p className="text-rose-600">Erro de autenticação: ID de usuário não disponível. Verifique o console.</p>
+        </div>
+      );
+    }
+    switch (currentPage) {
+      case 'Início':
+        return <HomePage cards={cards} incomeTotal={totalIncome} expenseTotal={totalExpense} />;
+      case 'Cartões':
+        return <CreditCardsPage cards={cards} userId={userId} db={db} />;
+      case 'Receitas':
+        return <TransactionManager userId={userId} db={db} type="Receitas" collectionName="incomes" icon={TrendingUp} />;
+      case 'Despesas':
+        return <TransactionManager userId={userId} db={db} type="Despesas" collectionName="expenses" icon={TrendingDown} />;
+      case 'Análise':
+        return <ExpenseAnalysisPage expenses={expenses} />;
+      default:
+        return <HomePage cards={cards} incomeTotal={totalIncome} expenseTotal={totalExpense} />;
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-100 flex flex-col font-sans">
+      {/* Cabeçalho */}
+      <header className="bg-white shadow-lg p-4 sticky top-0 z-10">
+        {/* Usa Indigo 700 para mais autoridade */}
+        <h1 className="text-xl font-extrabold text-indigo-700 text-center">
+          Controle de Crédito & Fluxo de Caixa
+        </h1>
+        {userId && (
+            <p className="text-xs text-center text-gray-500 mt-1 break-all">
+                Usuário ID: {userId}
+            </p>
+        )}
+      </header>
+
+      {/* Área de Conteúdo Principal */}
+      <main className="flex-grow pb-20">
+        {renderPage()}
+      </main>
+
+      {/* Barra de Navegação Móvel (5 guias) */}
+      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-2xl z-20">
+        <div className="flex justify-around h-16 max-w-lg mx-auto">
+          {/* 1. Início */}
+          <NavItem
+            name="Início"
+            icon={Home}
+            isActive={currentPage === 'Início'}
+            onClick={() => setCurrentPage('Início')}
+          />
+          {/* 2. Cartões de Crédito */}
+          <NavItem
+            name="Cartões"
+            icon={CreditCard}
+            isActive={currentPage === 'Cartões'}
+            onClick={() => setCurrentPage('Cartões')}
+          />
+          {/* 3. Receitas */}
+          <NavItem
+            name="Receitas"
+            icon={TrendingUp}
+            isActive={currentPage === 'Receitas'}
+            onClick={() => setCurrentPage('Receitas')}
+          />
+          {/* 4. Despesas */}
+          <NavItem
+            name="Despesas"
+            icon={TrendingDown}
+            isActive={currentPage === 'Despesas'}
+            onClick={() => setCurrentPage('Despesas')}
+          />
+          {/* 5. Análise (Novo) */}
+          <NavItem
+            name="Análise"
+            icon={BarChart3}
+            isActive={currentPage === 'Análise'}
+            onClick={() => setCurrentPage('Análise')}
+          />
+        </div>
+      </nav>
+    </div>
+  );
+};
+
+const NavItem = ({ name, icon: Icon, isActive, onClick }) => (
+  <button
+    onClick={onClick}
+    className={`flex flex-col items-center justify-center px-1 sm:px-2 w-1/5 transition duration-300 ${
+      // Usa Indigo 700 para mais confiança na aba ativa
+      isActive ? 'text-indigo-700 font-semibold border-t-2 border-indigo-700 -mt-0.5 pt-0.5' : 'text-gray-500 hover:text-indigo-600 hover:bg-gray-50'
+    }`}
+    aria-current={isActive ? 'page' : undefined}
+  >
+    {/* Animação: Ícone com escala no estado ativo */}
+    <Icon className={`w-6 h-6 mb-0.5 transform transition duration-300 ${isActive ? 'scale-110 text-indigo-700' : ''}`} />
+    <span className="text-xs">{name}</span>
+  </button>
+);
+
+export default App;
